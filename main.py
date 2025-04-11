@@ -1,4 +1,4 @@
-from frontend.app import StockMonitorApp
+from app import StockMonitorApp
 import customtkinter as ctk
 
 def main():
