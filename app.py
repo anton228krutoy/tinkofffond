@@ -8,6 +8,7 @@ from matplotlib.figure import Figure
 import matplotlib.dates as mdates
 from matplotlib.widgets import SpanSelector
 import numpy as np
+from lstm_predictor import LSTMPredictor  # Импорт модуля LSTM
 
 sys.path.append(str(Path(__file__).parent))
 
@@ -23,12 +24,10 @@ class StockMonitorApp(ctk.CTk):
         self.api = TinkoffApiClient()
         self.processor = DataProcessor()
         
-        # Поддерживаемые интервалы с максимальными периодами
         self.period_settings = {
             "1 день": {"interval": "1min", "days": 1},
             "3 дня": {"interval": "5min", "days": 3},
             "1 неделя": {"interval": "15min", "days": 7},
-            # Для периодов больше недели используем дневные данные через day=1
             "1 месяц": {"interval": "day", "days": 30},
             "3 месяца": {"interval": "day", "days": 90},
             "1 год": {"interval": "day", "days": 365}
@@ -36,9 +35,15 @@ class StockMonitorApp(ctk.CTk):
         
         self.current_data = None
         self.original_limits = None
+        self.current_figi = None
+        self.current_period = None
         
         self.setup_ui()
         self.load_and_plot_data()
+
+        self.selected_range = None  # Для хранения выбранного диапазона
+        self.lstm_predictor = None  # Объект LSTM
+
     
     def setup_ui(self):
         """Настройка интерфейса"""
@@ -86,6 +91,30 @@ class StockMonitorApp(ctk.CTk):
             props=dict(alpha=0.5, facecolor='yellow'),
             interactive=True
         )
+        
+        # Добавляем аннотацию для отображения цены и времени
+        self.price_annotation = self.ax.annotate(
+            "",
+            xy=(0, 0),
+            xytext=(10, 10),
+            textcoords="offset points",
+            bbox=dict(boxstyle="round", fc="w"),
+            arrowprops=dict(arrowstyle="->")
+        )
+        self.price_annotation.set_visible(False)
+
+        # Добавляем кнопку для прогноза LSTM
+        self.predict_button = ctk.CTkButton(
+            control_frame,
+            text="Прогноз LSTM",
+            command=self.activate_range_selection,
+            fg_color="green"
+        )
+        self.predict_button.pack(side=tk.LEFT, padx=5)
+        
+        # Подключаем обработчики событий мыши
+        self.canvas.mpl_connect("motion_notify_event", self.on_mouse_move)
+        self.canvas.mpl_connect("figure_leave_event", self.on_mouse_leave)
     
     def convert_quotation_to_float(self, quotation):
         """Конвертирует объект Quotation в float"""
@@ -101,7 +130,6 @@ class StockMonitorApp(ctk.CTk):
             period = self.period_var.get()
             settings = self.period_settings[period]
             
-            # Получаем данные
             candles = self.api.get_candles(
                 figi=figi,
                 interval=settings["interval"],
@@ -117,6 +145,8 @@ class StockMonitorApp(ctk.CTk):
             prices = np.array([self.convert_quotation_to_float(candle.close) for candle in candles])
             
             self.current_data = (timestamps, prices)
+            self.current_figi = figi
+            self.current_period = period
             
             # Очищаем и рисуем график
             self.ax.clear()
@@ -133,26 +163,75 @@ class StockMonitorApp(ctk.CTk):
             
         except Exception as e:
             print(f"Ошибка: {e}")
+
+
+    def activate_range_selection(self):
+        """Активирует выбор диапазона для прогноза."""
+        self.predict_button.configure(text="Выберите диапазон на графике", fg_color="orange")
+        self.span = SpanSelector(
+            self.ax,
+            self.on_range_selected,
+            'horizontal',
+            useblit=True,
+            props=dict(alpha=0.3, facecolor='red')
+        )
+
+    def on_range_selected(self, xmin, xmax):
+        """Обрабатывает выбранный диапазон и строит прогноз."""
+        if self.current_data is None:
+            return
+
+        timestamps, prices = self.current_data
+        xmin_dt = mdates.num2date(xmin)
+        xmax_dt = mdates.num2date(xmax)
+
+        # Находим индексы выбранного диапазона
+        mask = (timestamps >= xmin_dt) & (timestamps <= xmax_dt)
+        selected_indices = np.where(mask)[0]
+
+        if len(selected_indices) == 0:
+            return
+
+        start_idx, end_idx = selected_indices[0], selected_indices[-1]
+        self.selected_range = (start_idx, end_idx)
+
+        # Инициализируем и обучаем LSTM на всех данных до выбранного диапазона
+        self.lstm_predictor = LSTMPredictor(prices[:end_idx].reshape(-1, 1))
+        self.lstm_predictor.train(epochs=20)
+
+        # Прогнозируем и отображаем
+        pred_prices = self.lstm_predictor.predict(len(prices[start_idx:end_idx]))
+
+        # Отображаем прогноз на графике
+        self.ax.plot(timestamps[start_idx:end_idx], pred_prices, 'r--', label='LSTM Прогноз')
+        
+        # Возвращаем кнопку в исходное состояние
+        self.predict_button.configure(text="Прогноз LSTM", fg_color="green")
+
+    # ... (остальные методы класса)
     
     def configure_axes(self, interval):
         """Настройка осей в зависимости от интервала"""
         locator_map = {
-            "1min": mdates.HourLocator(interval=1),
-            "5min": mdates.HourLocator(interval=1),
-            "15min": mdates.DayLocator(interval=1),
-            "day": mdates.DayLocator(interval=7)  # Для дневных данных
+            "1min": mdates.AutoDateLocator(),
+            "5min": mdates.AutoDateLocator(),
+            "15min": mdates.AutoDateLocator(),
+            "day": mdates.AutoDateLocator()
         }
         
         formatter_map = {
-            "1min": mdates.DateFormatter('%H:%M'),
-            "5min": mdates.DateFormatter('%H:%M'),
-            "15min": mdates.DateFormatter('%Y-%m-%d'),
-            "day": mdates.DateFormatter('%Y-%m-%d')  # Для дневных данных
+            "1min": mdates.ConciseDateFormatter(locator_map[interval]),
+            "5min": mdates.ConciseDateFormatter(locator_map[interval]),
+            "15min": mdates.ConciseDateFormatter(locator_map[interval]),
+            "day": mdates.ConciseDateFormatter(locator_map[interval])
         }
         
-        self.ax.xaxis.set_major_locator(locator_map.get(interval))
-        self.ax.xaxis.set_major_formatter(formatter_map.get(interval))
+        self.ax.xaxis.set_major_locator(locator_map[interval])
+        self.ax.xaxis.set_major_formatter(formatter_map[interval])
         self.fig.autofmt_xdate()
+        
+        # Настройка формата цены
+        self.ax.yaxis.set_major_formatter('{x:,.2f}')
     
     def on_zoom_select(self, xmin, xmax):
         """Обработчик зума"""
@@ -169,9 +248,14 @@ class StockMonitorApp(ctk.CTk):
         
         if len(visible_data) > 0:
             self.ax.set_xlim(xmin, xmax)
+            # Добавляем небольшой отступ по y для лучшего отображения
+            y_min = np.min(visible_data)
+            y_max = np.max(visible_data)
+            y_padding = (y_max - y_min) * 0.05  # 5% от диапазона
+            
             self.ax.set_ylim(
-                np.min(visible_data) * 0.99,
-                np.max(visible_data) * 1.01
+                y_min - y_padding,
+                y_max + y_padding
             )
             self.canvas.draw_idle()
     
@@ -181,6 +265,39 @@ class StockMonitorApp(ctk.CTk):
             self.ax.set_xlim(self.original_limits[0])
             self.ax.set_ylim(self.original_limits[1])
             self.canvas.draw_idle()
+    
+    def on_mouse_move(self, event):
+        """Обработчик движения мыши для отображения цены и времени"""
+        if event.inaxes != self.ax or self.current_data is None:
+            self.price_annotation.set_visible(False)
+            self.canvas.draw_idle()
+            return
+            
+        timestamps, prices = self.current_data
+        
+        # Находим ближайшую точку данных
+        xdata = mdates.num2date(event.xdata)
+        idx = np.argmin(np.abs(timestamps - xdata))
+        
+        if 0 <= idx < len(prices):
+            price = prices[idx]
+            timestamp = timestamps[idx]
+            
+            # Форматируем время в зависимости от интервала
+            if self.current_period in ["1 месяц", "3 месяца", "1 год"]:
+                time_str = timestamp.strftime('%Y-%m-%d')
+            else:
+                time_str = timestamp.strftime('%Y-%m-%d %H:%M:%S')
+            
+            self.price_annotation.xy = (timestamp, price)
+            self.price_annotation.set_text(f"{time_str}\nЦена: {price:.2f}")
+            self.price_annotation.set_visible(True)
+            self.canvas.draw_idle()
+    
+    def on_mouse_leave(self, event):
+        """Скрываем аннотацию при выходе за пределы графика"""
+        self.price_annotation.set_visible(False)
+        self.canvas.draw_idle()
 
 if __name__ == "__main__":
     ctk.set_appearance_mode("Dark")

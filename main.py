@@ -9,3 +9,19 @@ def main():
 
 if __name__ == "__main__":
     main()
+ 
+"""
+Как включить среду в анаконде:
+
+conda activate tinkoff_env
+
+Github
+
+ВЫГРУЗКА
+git add .
+git commit -m "Huesos"
+git push -u origin master
+
+ЗАГРУЗКА
+git pull origin master
+"""
